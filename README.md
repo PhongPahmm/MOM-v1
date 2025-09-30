@@ -111,6 +111,5 @@ AI_SERVICE_URL=http://localhost:8001
 
 ## 📝 Ghi chú
 
-- Dự án cũ (`backend/` và `frontend/`) có thể được xóa sau khi kiểm tra hoạt động của dự án mới
 - Đảm bảo các API keys được cấu hình đúng trong file `.env`
 - Các service cần được chạy theo thứ tự: AI Service → Backend → Frontend
