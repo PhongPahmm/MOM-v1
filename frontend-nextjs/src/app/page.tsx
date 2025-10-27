@@ -1,8 +1,9 @@
 'use client'
 
 import { useState } from 'react'
+import Link from 'next/link'
 import { Container, Row, Col, Card, Button, Form, Nav, Tab, Badge, ListGroup, Alert } from 'react-bootstrap'
-import { Upload, FileText, Mic, Download, Clock, Users, CheckCircle, AlertCircle, Edit3, Send, FileText as FileTextIcon } from 'lucide-react'
+import { Upload, FileText, Mic, Clock, Users, CheckCircle, AlertCircle, Edit3, Send, FileText as FileTextIcon } from 'lucide-react'
 import { useDropzone } from 'react-dropzone'
 import axios from 'axios'
 
@@ -51,7 +52,7 @@ interface ProcessResponse {
   }
   action_items?: ActionItem[]
   decisions?: Decision[]
-  diarization?: any[]
+  diarization?: Array<{ speaker: string; text: string; timestamp: number }>
 }
 
 export default function Home() {
@@ -166,7 +167,7 @@ export default function Home() {
   }
 
   // Update editable MoM data
-  const updateEditableMom = (field: keyof MomContent, value: any) => {
+  const updateEditableMom = (field: keyof MomContent, value: string | string[] | ActionItem[] | Decision[]) => {
     if (!editableMom) return
     setEditableMom({
       ...editableMom,
@@ -214,7 +215,7 @@ export default function Home() {
       /(?:deadline|due|by)\s+([^.!?]+)/gi
     ]
     
-    lines.forEach((line, index) => {
+    lines.forEach((line) => {
       actionPatterns.forEach(pattern => {
         const matches = line.match(pattern)
         if (matches) {
@@ -340,6 +341,11 @@ export default function Home() {
             <div className="text-center mb-4">
               <h1 className="display-4 fw-bold text-primary mb-2">Smart Meeting Minutes</h1>
               <p className="lead text-muted">Upload audio or transcript to generate intelligent meeting summaries</p>
+              <div className="d-flex gap-2 justify-content-center mt-3">
+                <Link href="/meeting/realtime" className="btn btn-primary">
+                  Meeting realtime
+                </Link>
+              </div>
         </div>
 
           {/* Language Selection */}

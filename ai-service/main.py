@@ -93,7 +93,10 @@ async def extract_content(
         if not sentences:
             raise HTTPException(status_code=400, detail="No meaningful content found")
         
-        actions, decisions = extract_actions_and_decisions(sentences)
+        # Try to get diarization data for better extraction
+        cleaned = clean_transcript(text)
+        segments = diarize(cleaned)
+        actions, decisions = extract_actions_and_decisions(sentences, segments)
         
         return {
             "action_items": [
@@ -148,8 +151,8 @@ async def process_full(
         
         # Get structured summary data
         structured_summary = summarize(sentences, language)
-        actions, decisions = extract_actions_and_decisions(sentences)
         segments = diarize(cleaned)
+        actions, decisions = extract_actions_and_decisions(sentences, segments)
 
         return {
             "transcript": cleaned,
