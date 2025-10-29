@@ -1,5 +1,6 @@
 from typing import List, Dict, Any
 import json
+import time
 
 try:
     import google.generativeai as genai  # type: ignore
@@ -52,24 +53,48 @@ def summarize(sentences: List[str], language: str = "vi") -> Dict[str, Any]:
             + "\n\nContent:\n"
             + "\n".join(sentences)
         )
-        resp = model.generate_content(prompt)
-        text = getattr(resp, "text", None)
+        # Retry logic với exponential backoff cho rate limit errors
+        max_retries = 3
+        retry_delay = 2  # seconds
         
-        if text:
-            # Try to parse JSON response
+        for attempt in range(max_retries):
             try:
-                # Clean the response text (remove markdown formatting if present)
-                cleaned_text = text.strip()
-                if cleaned_text.startswith("```json"):
-                    cleaned_text = cleaned_text[7:]
-                if cleaned_text.endswith("```"):
-                    cleaned_text = cleaned_text[:-3]
+                resp = model.generate_content(prompt)
+                text = getattr(resp, "text", None)
                 
-                structured_data = json.loads(cleaned_text)
-                return structured_data
-            except json.JSONDecodeError:
-                print(f"Failed to parse JSON response: {text}")
-                return _get_fallback_structured_content(text, sentences)
+                if text:
+                    # Try to parse JSON response
+                    try:
+                        # Clean the response text (remove markdown formatting if present)
+                        cleaned_text = text.strip()
+                        if cleaned_text.startswith("```json"):
+                            cleaned_text = cleaned_text[7:]
+                        if cleaned_text.endswith("```"):
+                            cleaned_text = cleaned_text[:-3]
+                        
+                        structured_data = json.loads(cleaned_text)
+                        return structured_data
+                    except json.JSONDecodeError:
+                        print(f"Failed to parse JSON response: {text}")
+                        return _get_fallback_structured_content(text, sentences)
+                
+                return _get_default_structured_content(sentences)
+                
+            except Exception as api_error:
+                error_message = str(api_error).lower()
+                # Kiểm tra xem có phải lỗi rate limit/quota không
+                if "429" in error_message or "resource exhausted" in error_message or "quota" in error_message:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                        print(f"Rate limit error (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"Rate limit error after {max_retries} attempts. Using fallback response.")
+                        return _get_default_structured_content(sentences)
+                else:
+                    # Lỗi khác, không retry
+                    raise
         
         return _get_default_structured_content(sentences)
         
