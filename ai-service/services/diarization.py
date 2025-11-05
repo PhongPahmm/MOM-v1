@@ -3,31 +3,41 @@ from typing import List, Tuple
 
 def diarize(text: str) -> List[Tuple[str, str]]:
 	"""
-	Simple speaker diarization based on text patterns.
-	In a real implementation, this would use audio-based speaker recognition.
+	Speaker diarization based on text patterns.
+	Optimized for accuracy in meeting minutes - preserves full context when no clear speakers.
 	"""
 	if not text:
 		return []
 	
-	# Common speaker indicators in transcripts
+	# Extended speaker indicators including department names and roles
 	speaker_patterns = [
+		# Explicit speaker labels
 		r'(?:Speaker\s*\d+)',
 		r'(?:Người\s+nói\s*\d+)',
 		r'(?:Person\s*\d+)',
 		r'(?:P\d+)',
 		r'(?:S\d+)',
-		r'(?:Mr\.?\s+\w+)',
-		r'(?:Ms\.?\s+\w+)',
-		r'(?:Mrs\.?\s+\w+)',
-		r'(?:Anh\s+\w+)',
-		r'(?:Chị\s+\w+)',
-		r'(?:Ông\s+\w+)',
-		r'(?:Bà\s+\w+)',
+		# Titles with names
+		r'(?:Mr\.?\s+[A-Z][a-z]+)',
+		r'(?:Ms\.?\s+[A-Z][a-z]+)',
+		r'(?:Mrs\.?\s+[A-Z][a-z]+)',
+		r'(?:Dr\.?\s+[A-Z][a-z]+)',
+		r'(?:Anh\s+[A-Z][a-z]+)',
+		r'(?:Chị\s+[A-Z][a-z]+)',
+		r'(?:Ông\s+[A-Z][a-z]+)',
+		r'(?:Bà\s+[A-Z][a-z]+)',
+		# Department/Role indicators (common in meetings)
+		r'(?:HR)',
+		r'(?:Finance)',
+		r'(?:IT)',
+		r'(?:Manager[s]?)',
+		r'(?:Team Lead)',
+		r'(?:Director)',
 	]
 	
 	# Split text into potential speaker segments
 	segments = []
-	current_speaker = "Speaker 1"
+	current_speaker = "Unknown"
 	current_text = ""
 	
 	lines = text.split('\n')
@@ -66,20 +76,11 @@ def diarize(text: str) -> List[Tuple[str, str]]:
 	if current_text.strip():
 		segments.append((current_speaker, current_text.strip()))
 	
-	# If no speaker patterns found, treat as single speaker
-	if not segments:
-		# Try to split by sentences and assign to different speakers
-		sentences = re.split(r'[.!?]+', text)
-		sentences = [s.strip() for s in sentences if s.strip()]
-		
-		if len(sentences) <= 1:
-			return [("Speaker 1", text)]
-		
-		# Distribute sentences among speakers
-		speakers = ["Speaker 1", "Speaker 2", "Speaker 3"]
-		segments = []
-		for i, sentence in enumerate(sentences):
-			speaker = speakers[i % len(speakers)]
-			segments.append((speaker, sentence))
+	# CRITICAL: If no speaker patterns found, treat as SINGLE speaker
+	# This is more accurate than randomly distributing - keeps context intact
+	if not segments or (len(segments) == 1 and segments[0][0] == "Unknown"):
+		# Return full text as single speaker
+		# This preserves all context for extraction algorithms
+		return [("Meeting Transcript", text)]
 	
 	return segments

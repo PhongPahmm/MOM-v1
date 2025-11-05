@@ -1,77 +1,62 @@
 from typing import Optional
 import os
-import json
-import requests
+
+try:
+    import whisper
+except ImportError:
+    whisper = None
 
 from core.config import settings
 
+# Global model cache
+_whisper_model = None
+
+def _get_whisper_model():
+    """Lazy load Whisper model to avoid loading on import"""
+    global _whisper_model
+    if _whisper_model is None:
+        if whisper is None:
+            raise ImportError(
+                "Whisper is not installed. Please install it with: pip install openai-whisper"
+            )
+        
+        model_size = settings.whisper_model_size or "base"
+        print(f"Loading Whisper model ({model_size})... This may take a while on first run.")
+        _whisper_model = whisper.load_model(model_size)
+        print(f"Whisper model loaded successfully.")
+    
+    return _whisper_model
+
 async def transcribe_audio(file_path: str, language: Optional[str] = None) -> str:
     """
-    Transcribe audio file using Speechmatics API (free plan available).
+    Transcribe audio file using Whisper (local model).
     """
-    speechmatics_api_key = settings.speechmatics_api_key  # bạn cần set trong .env
-    if not speechmatics_api_key:
-        raise ValueError(
-            "Speechmatics API key is not configured. Please set SPEECHMATICS_API_KEY in your environment "
-            "variables or .env file. Get your API key from: https://portal.speechmatics.com/api-key"
-        )
+    if not os.path.exists(file_path):
+        raise ValueError(f"Audio file not found: {file_path}")
 
     try:
-        # Step 1: Upload file
-        url = "https://asr.api.speechmatics.com/v2/jobs/"
-        headers = {"Authorization": f"Bearer {speechmatics_api_key}"}
-
-        # Map language codes for Speechmatics
-        speechmatics_lang = language or "en"
-        if speechmatics_lang == "vi":
-            speechmatics_lang = "vi"  # Speechmatics supports Vietnamese
-
-        config_data = {
-            "type": "transcription",
-            "transcription_config": {
-                "language": speechmatics_lang,
-                "operating_point": "standard"
-            }
-        }
-
-        with open(file_path, "rb") as f:
-            files = {"data_file": f}
-            data = {"config": json.dumps(config_data)}
-            response = requests.post(url, headers=headers, data=data, files=files)
-
-        if response.status_code != 201:
-            raise ValueError(f"Speechmatics job creation failed: {response.status_code} - {response.text}")
-
-        job_id = response.json().get("id")
-        if not job_id:
-            raise ValueError(f"Speechmatics did not return job id: {response.text}")
-
-        # Step 2: Poll for result
-        result_url = f"{url}{job_id}/transcript?format=txt"
-        max_attempts = 60  # poll tối đa 60 lần (60 giây)
+        model = _get_whisper_model()
         
-        for attempt in range(max_attempts):
-            import asyncio
-            await asyncio.sleep(1)  # Đợi 1 giây trước khi poll
-            
-            r = requests.get(result_url, headers=headers)
-            if r.status_code == 200:
-                transcript = r.text.strip()
-                if transcript:
-                    return transcript
-                else:
-                    # Nếu response trống, tiếp tục polling
-                    continue
-            elif r.status_code == 404:
-                # job chưa xong, tiếp tục polling
-                continue
-            elif r.status_code == 400:
-                # Bad request, có thể job failed
-                raise ValueError(f"Speechmatics job failed: {r.text}")
-            else:
-                raise ValueError(f"Speechmatics result error: {r.status_code} - {r.text}")
-
-        raise TimeoutError(f"Speechmatics transcription timed out after {max_attempts} seconds")
+        # Map language code
+        whisper_lang = language or "en"
+        if whisper_lang == "vi":
+            whisper_lang = "vi"
+        
+        # Transcribe audio
+        print(f"Transcribing audio file: {file_path}")
+        result = model.transcribe(
+            file_path,
+            language=whisper_lang if whisper_lang != "auto" else None,
+            fp16=False  # Set to False for CPU, True for GPU
+        )
+        
+        transcript = result.get("text", "").strip()
+        
+        if not transcript:
+            raise ValueError("Transcription resulted in empty text")
+        
+        print(f"Transcription completed. Length: {len(transcript)} characters")
+        return transcript
 
     except Exception as e:
-        raise ValueError(f"Speechmatics transcription failed: {e}")
+        raise ValueError(f"Whisper transcription failed: {e}")

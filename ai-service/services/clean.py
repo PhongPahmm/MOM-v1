@@ -2,49 +2,63 @@ import re
 from typing import List
 
 def clean_transcript(text: str) -> str:
-	"""Clean and normalize transcript text by removing filler words and improving formatting."""
+	"""
+	Clean and normalize transcript text with minimal information loss.
+	Optimized for accuracy in meeting minutes extraction.
+	"""
 	if not text:
 		return ""
 	
-	# Common filler words in Vietnamese and English
+	# ONLY remove true filler words that don't carry meaning
+	# Be very conservative - when in doubt, keep the word
 	filler_words = [
-		"uh", "um", "ah", "eh", "er", "hmm", "oh", "well", "you know", "like", "so", "actually",
-		"basically", "literally", "obviously", "clearly", "definitely", "probably", "maybe",
-		"kind of", "sort of", "i mean", "right", "okay", "ok", "yeah", "yes", "no",
-		# Vietnamese fillers
-		"ừ", "ờ", "à", "ạ", "thì", "là", "và", "có thể", "chắc là", "có lẽ", "được rồi",
-		"đúng rồi", "thôi", "này", "ấy", "nhé", "nhá", "đó", "đây", "kia", "nọ"
+		# English fillers - only clear hesitations
+		"uh", "um", "ah", "eh", "er", "hmm", "oh",
+		"you know", "i mean", "kind of", "sort of", "like actually",
+		# Vietnamese fillers - only clear hesitations
+		"ừ", "ờ", "à", "ạ", "nhé", "nhá"
 	]
 	
-	# Normalize whitespace
+	# Normalize whitespace first
 	text = re.sub(r'\s+', ' ', text)
 	text = text.strip()
 	
-	# Remove filler words (case insensitive)
-	words = text.split()
-	cleaned_words = []
+	# Remove ONLY obvious filler phrases (case insensitive, word boundary aware)
+	for filler in filler_words:
+		# Use word boundaries to avoid partial matches
+		pattern = r'\b' + re.escape(filler) + r'\b'
+		text = re.sub(pattern, '', text, flags=re.IGNORECASE)
 	
-	for word in words:
-		# Remove punctuation for comparison
-		clean_word = re.sub(r'[^\w]', '', word.lower())
-		if clean_word not in filler_words and len(clean_word) > 0:
-			cleaned_words.append(word)
-	
-	# Join back and clean up punctuation
-	result = ' '.join(cleaned_words)
-	
-	# Fix sentence endings
-	result = re.sub(r'\s*\.\s*', '. ', result)
-	result = re.sub(r'\s*,\s*', ', ', result)
-	result = re.sub(r'\s*;\s*', '; ', result)
-	result = re.sub(r'\s*:\s*', ': ', result)
+	# Clean up punctuation spacing (but preserve the punctuation itself)
+	text = re.sub(r'\s*\.\s*', '. ', text)
+	text = re.sub(r'\s*,\s*', ', ', text)
+	text = re.sub(r'\s*;\s*', '; ', text)
+	text = re.sub(r'\s*:\s*', ': ', text)
+	text = re.sub(r'\s*\?\s*', '? ', text)
+	text = re.sub(r'\s*!\s*', '! ', text)
 	
 	# Fix multiple spaces
-	result = re.sub(r'\s+', ' ', result)
+	text = re.sub(r'\s+', ' ', text)
+	
+	# Remove spaces before punctuation at end of sentences
+	text = re.sub(r'\s+([.!?])', r'\1', text)
 	
 	# Capitalize first letter of sentences
-	sentences = result.split('. ')
-	sentences = [sentence.strip().capitalize() if sentence.strip() else sentence for sentence in sentences]
-	result = '. '.join(sentences)
+	sentences = re.split(r'([.!?])\s+', text)
+	result = []
+	for i, part in enumerate(sentences):
+		if i % 2 == 0 and part:  # Text parts (not punctuation)
+			result.append(part.strip().capitalize() if part.strip() else part)
+		else:  # Punctuation
+			result.append(part)
+	text = ''.join(result)
 	
-	return result.strip()
+	# Final cleanup
+	text = re.sub(r'\s+', ' ', text)
+	text = text.strip()
+	
+	# Ensure sentence ends with punctuation
+	if text and not text[-1] in '.!?':
+		text += '.'
+	
+	return text
