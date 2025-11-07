@@ -20,7 +20,8 @@ def _get_whisper_model():
                 "Whisper is not installed. Please install it with: pip install openai-whisper"
             )
         
-        model_size = settings.whisper_model_size or "base"
+        # Luôn sử dụng tiny model để tiết kiệm tài nguyên
+        model_size = settings.whisper_model_size
         print(f"Loading Whisper model ({model_size})... This may take a while on first run.")
         _whisper_model = whisper.load_model(model_size)
         print(f"Whisper model loaded successfully.")

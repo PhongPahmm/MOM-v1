@@ -6,500 +6,416 @@ from schemas.mom import ActionItem, Decision
 from core.config import settings
 
 try:
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    import torch
+    from openai import OpenAI
+    from openai import AuthenticationError, PermissionDeniedError, APIError
 except ImportError:
-    AutoTokenizer = None
-    AutoModelForCausalLM = None
-    torch = None
+    OpenAI = None
+    AuthenticationError = None
+    PermissionDeniedError = None
+    APIError = None
 
-# Global model cache
-_llm_model = None
-_llm_tokenizer = None
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
-_EXTRACTION_PROMPT = (
-    "You are a precise meeting minutes assistant. Extract action items and decisions from meeting transcripts.\n"
-    "CRITICAL: Return ONLY valid JSON. No markdown, no text before/after. Just pure JSON starting with { and ending with }.\n\n"
-    
-    "REQUIRED JSON FORMAT:\n"
-    "{\n"
-    '  "action_items": [{"description": "string", "owner": "string or null", "due_date": "string or null", "priority": "string or null"}],\n'
-    '  "decisions": [{"text": "string", "owner": "string or null"}]\n'
-    "}\n\n"
-    
-    "ACTION ITEMS - What to extract:\n"
-    "• Explicit assignments: 'HR will draft policy by October 15'\n"
-    "  → Extract: owner='HR', description='draft policy', due_date='October 15'\n"
-    "• Task commitments: 'Finance needs to finalize budget by October 20'\n"
-    "  → Extract: owner='Finance', description='finalize budget', due_date='October 20'\n"
-    "• Must/Should statements: 'IT must enforce VPN requirements'\n"
-    "  → Extract: owner='IT', description='enforce VPN requirements'\n"
-    "• Multiple tasks in one sentence: Extract each separately\n"
-    "• ONLY extract clear, actionable tasks with verbs (draft, finalize, schedule, enforce, etc.)\n"
-    "• DO NOT extract general statements or descriptions\n\n"
-    
-    "DECISIONS - What to extract:\n"
-    "• Proposals accepted: 'proposal is to introduce 3-day remote work'\n"
-    "  → Extract: text='introduce 3-day remote work policy'\n"
-    "• Agreements: 'we agreed to provide home office allowance'\n"
-    "  → Extract: text='provide home office allowance'\n"
-    "• Policy changes: 'policy will emphasize output-based metrics'\n"
-    "  → Extract: text='emphasize output-based metrics'\n"
-    "• Consensus: 'consensus was that allowance is investment'\n"
-    "  → Extract: text='home office allowance is investment in productivity'\n"
-    "• Implementation plans: 'guideline will be rolled out as pilot'\n"
-    "  → Extract: text='roll out guideline as 3-month pilot'\n\n"
-    
-    "CRITICAL RULES:\n"
-    "1. Keep descriptions concise (under 100 characters)\n"
-    "2. Keep decision text concise (under 150 characters)\n"
-    "3. Extract owner names exactly as mentioned (HR, Finance, IT, Managers, etc.)\n"
-    "4. Extract due dates exactly as stated (october 15, end of october, november 1, etc.)\n"
-    "5. If no owner/date mentioned, use null\n"
-    "6. If no action items or decisions found, return empty arrays\n"
-    "7. Do not invent or assume information not in transcript\n\n"
-    
-    "EXAMPLES:\n\n"
-    
-    "Example 1:\n"
-    'Input: "Action items were assigned. HR will draft the policy by October 15. Finance will finalize budget by October 20."\n'
-    "Output:\n"
-    "{\n"
-    '  "action_items": [\n'
-    '    {"description": "draft the policy", "owner": "HR", "due_date": "October 15", "priority": null},\n'
-    '    {"description": "finalize budget", "owner": "Finance", "due_date": "October 20", "priority": null}\n'
-    '  ],\n'
-    '  "decisions": []\n'
-    "}\n\n"
-    
-    "Example 2:\n"
-    'Input: "We decided to implement a 3-day remote work policy. The proposal includes mandatory team days twice per month."\n'
-    "Output:\n"
-    "{\n"
-    '  "action_items": [],\n'
-    '  "decisions": [\n'
-    '    {"text": "implement 3-day remote work policy", "owner": null},\n'
-    '    {"text": "mandatory team days twice per month", "owner": null}\n'
-    '  ]\n'
-    "}\n\n"
-    
-    "Example 3:\n"
-    'Input: "Managers must schedule weekly check-ins starting November 1. We agreed to use output-based metrics."\n'
-    "Output:\n"
-    "{\n"
-    '  "action_items": [\n'
-    '    {"description": "schedule weekly check-ins", "owner": "Managers", "due_date": "November 1", "priority": null}\n'
-    '  ],\n'
-    '  "decisions": [\n'
-    '    {"text": "use output-based metrics", "owner": null}\n'
-    '  ]\n'
-    "}\n\n"
-    
-    "Now extract from the following transcript. Return ONLY the JSON object:\n"
-)
+_openai_client = None
+_gemini_client = None
 
-def _get_llm_model():
-    """Lazy load LLM model to avoid loading on import"""
-    global _llm_model, _llm_tokenizer
-    
-    if _llm_model is None or _llm_tokenizer is None:
-        if AutoTokenizer is None or AutoModelForCausalLM is None or torch is None:
-            raise ImportError(
-                "Transformers or PyTorch is not installed. Please install with: pip install transformers torch"
-            )
-        
-        model_name = settings.llm_model_name or "google/gemma-2b-it"
-        print(f"Loading LLM model ({model_name})... This may take a while on first run.")
-        
-        _llm_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        _llm_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True
-        )
-        
-        if not torch.cuda.is_available():
-            _llm_model = _llm_model.to("cpu")
-        
-        print(f"LLM model loaded successfully.")
-    
-    return _llm_model, _llm_tokenizer
+# ------------------ PROMPT ĐƯỢC RÚT GỌN & TỐI ƯU ------------------
+_EXTRACTION_PROMPT = """Extract action items and decisions from this meeting transcript. Return ONLY valid JSON, no other text.
 
-def _generate_with_llm(prompt: str, max_new_tokens: int = 1024) -> str:
-    """Generate text using local LLM with optimized parameters for accuracy"""
-    model, tokenizer = _get_llm_model()
-    
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=6144)
-    
-    if torch.cuda.is_available():
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=0.2,  # Lower temperature for more accurate, deterministic output
-            do_sample=True,
-            top_p=0.85,  # Slightly lower for more focused output
-            top_k=40,  # Add top-k sampling for better quality
-            repetition_penalty=1.15,  # Prevent repetition
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id
-        )
-    
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Remove the input prompt from response
-    if response.startswith(prompt):
-        response = response[len(prompt):].strip()
-    
-    return response
+Required JSON format:
+{
+  "action_items": [
+    {"description": "task description", "owner": "name or null", "due_date": "date or null", "priority": "priority or null"}
+  ],
+  "decisions": [
+    {"text": "decision text", "owner": "name or null"}
+  ]
+}
 
-def _validate_and_clean_extraction(data: dict) -> dict:
-    """Validate and clean extracted data to ensure accuracy"""
-    cleaned = {
-        "action_items": [],
-        "decisions": []
-    }
-    
-    # Validate and clean action items
-    for item in data.get("action_items", []) or []:
-        description = item.get("description", "").strip()
-        owner = item.get("owner")
-        due_date = item.get("due_date")
-        priority = item.get("priority")
-        
-        # Skip invalid items
-        if not description or len(description) < 5:
-            continue
-        
-        # Clean description - must contain action verb
-        action_verbs = ['draft', 'finalize', 'prepare', 'schedule', 'enforce', 'implement', 
-                       'create', 'review', 'update', 'submit', 'complete', 'monitor',
-                       'analyze', 'develop', 'coordinate', 'organize', 'send', 'provide']
-        
-        has_action = any(verb in description.lower() for verb in action_verbs)
-        if not has_action:
-            continue
-        
-        # Limit length
-        if len(description) > 200:
-            description = description[:200]
-        
-        # Clean owner
-        if owner and isinstance(owner, str):
-            owner = owner.strip()
-            if len(owner) > 50 or owner.lower() in ['null', 'none', 'n/a', '']:
-                owner = None
-        else:
-            owner = None
-        
-        # Clean due_date
-        if due_date and isinstance(due_date, str):
-            due_date = due_date.strip()
-            if len(due_date) > 50 or due_date.lower() in ['null', 'none', 'n/a', '']:
-                due_date = None
-        else:
-            due_date = None
-        
-        cleaned["action_items"].append({
-            "description": description,
-            "owner": owner,
-            "due_date": due_date,
-            "priority": priority
-        })
-    
-    # Validate and clean decisions
-    for item in data.get("decisions", []) or []:
-        text = item.get("text", "").strip()
-        owner = item.get("owner")
-        
-        # Skip invalid decisions
-        if not text or len(text) < 10:
-            continue
-        
-        # Limit length
-        if len(text) > 250:
-            text = text[:250]
-        
-        # Clean owner
-        if owner and isinstance(owner, str):
-            owner = owner.strip()
-            if len(owner) > 50 or owner.lower() in ['null', 'none', 'n/a', '']:
-                owner = None
-        else:
-            owner = None
-        
-        cleaned["decisions"].append({
-            "text": text,
-            "owner": owner
-        })
-    
-    return cleaned
+Extract:
+- Action items: tasks assigned (look for "will", "needs to", "to do", "by [date]")
+- Decisions: agreements (look for "decided", "agreed", "approved")
+- Owner: person's name if mentioned
+- Due date: dates like "november 6, 2025", "tonight", "by 5 pm today"
 
-def _extract_with_rules(text: str) -> Tuple[List[ActionItem], List[Decision]]:
-    """Rule-based extraction as fallback"""
-    actions: List[ActionItem] = []
-    decisions: List[Decision] = []
+Transcript:
+"""
+
+# ------------------ OPENAI CLIENT INIT ------------------
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        if OpenAI is None:
+            raise ImportError("Install OpenAI with: pip install openai")
+        api_key = settings.openai_api_key
+        if not api_key:
+            # Try to get from environment variable
+            import os
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("Missing OPENAI_API_KEY in .env or environment.")
+        _openai_client = OpenAI(api_key=api_key)
+        print("✅ OpenAI client initialized.")
+    return _openai_client
+
+# ------------------ CONFIGURE GEMINI API KEY ------------------
+def _configure_gemini_api_key():
+    """Ensure Gemini API key is configured"""
+    import os
+    # Try multiple sources for API key
+    api_key = None
     
-    # Special handling for "Action items were assigned" section
-    action_section_match = re.search(
-        r'Action items were assigned\.(.*?)(?:Before closing|The next|$)',
-        text,
-        re.IGNORECASE | re.DOTALL
-    )
+    # 1. Try from settings (from .env file via pydantic)
+    api_key = settings.google_api_key
     
-    if action_section_match:
-        action_section = action_section_match.group(1)
-        
-        # Extract specific action items from this section
-        # Pattern: "X will Y by date"
-        specific_patterns = [
-            r'(\w+(?:\s+\w+)?)\s+will\s+([\w\s]+?)\s+by\s+((?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d+|the end of \w+|\d+\/\d+)',
-            r'(\w+(?:\s+\w+)?)\s+will\s+([\w\s]+?)\s+starting\s+((?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d+|the end of \w+|\w+\s+\d+)',
-        ]
-        
-        for pattern in specific_patterns:
-            matches = re.finditer(pattern, action_section, re.IGNORECASE)
-            for match in matches:
-                owner = match.group(1).strip().title()
-                description = match.group(2).strip()
-                due_date = match.group(3).strip()
-                
-                # Clean up description - remove extra words
-                description = re.sub(r'\s+', ' ', description).strip()
-                
-                if len(description) > 5 and len(owner) < 30:
-                    actions.append(ActionItem(
-                        description=description,
-                        owner=owner,
-                        due_date=due_date,
-                        priority=None
-                    ))
+    # 2. Try from environment variable (direct)
+    if not api_key:
+        api_key = os.getenv("GOOGLE_API_KEY")
     
-    # Split into sentences for general extraction
-    sentences = re.split(r'[.!?]+', text)
-    
-    # Extract more action items from general text
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence or len(sentence) < 20:
-            continue
-        
-        # Skip if already in action section
-        if action_section_match and sentence in action_section_match.group(0):
-            continue
-            
-        # Pattern: "X will Y" (but not too long)
-        match = re.search(
-            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+will\s+([\w\s]{10,80}?)(?:\s+by|\s+starting|\s+to|\.|$)',
-            sentence
-        )
-        if match:
-            owner = match.group(1).strip()
-            description = match.group(2).strip()
-            
-            # Check for due date in remaining sentence
-            due_date = None
-            due_match = re.search(
-                r'by\s+((?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d+|the end of \w+|\d+\/\d+)',
-                sentence,
-                re.IGNORECASE
-            )
-            if due_match:
-                due_date = due_match.group(1)
-            
-            if len(description) > 5:
-                actions.append(ActionItem(
-                    description=description,
-                    owner=owner,
-                    due_date=due_date,
-                    priority=None
-                ))
-        
-        # Pattern: "X must/should Y"
-        match = re.search(
-            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:must|should)\s+([\w\s]{10,80}?)(?:\s+by|\s+to|\.|$)',
-            sentence
-        )
-        if match:
-            owner = match.group(1).strip()
-            description = match.group(2).strip()
-            
-            if len(description) > 5:
-                actions.append(ActionItem(
-                    description=description,
-                    owner=owner,
-                    due_date=None,
-                    priority=None
-                ))
-    
-    # Extract decisions
-    decision_keywords = [
-        'proposal is to', 'proposal includes', 'policy will', 
-        'guideline will', 'decided to', 'agreed to', 
-        'consensus was', 'will be rolled out'
-    ]
-    
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence or len(sentence) < 20:
-            continue
-            
-        for keyword in decision_keywords:
-            if keyword in sentence.lower():
-                # Extract the decision part
-                parts = sentence.lower().split(keyword)
-                if len(parts) > 1:
-                    decision_text = parts[1].strip()
-                    # Clean up and limit length
-                    decision_text = re.sub(r'\s+', ' ', decision_text)
-                    
-                    # Remove trailing incomplete phrases
-                    decision_text = re.split(r'\s+(?:the|this|it|and|but|however)\s+', decision_text)[0]
-                    
-                    if len(decision_text) > 15 and len(decision_text) < 200:
-                        decisions.append(Decision(
-                            text=decision_text.strip(),
-                            owner=None
-                        ))
+    # 3. Try from os.environ directly (case-insensitive)
+    if not api_key:
+        for key, value in os.environ.items():
+            if key.upper() == "GOOGLE_API_KEY":
+                api_key = value
                 break
     
-    # Also extract from "To solve this" or "In response" sections
-    response_patterns = [
-        r'To solve this,\s+(.{20,200}?)(?:\.|$)',
-        r'In response,\s+(.{20,200}?)(?:\.|$)',
-        r'To address this,\s+(.{20,200}?)(?:\.|$)',
-        r'To compensate,\s+(.{20,200}?)(?:\.|$)',
+    if not api_key:
+        raise ValueError(
+            "Missing GOOGLE_API_KEY. Please set it in:\n"
+            "1. .env file: GOOGLE_API_KEY=your_key\n"
+            "2. Environment variable: export GOOGLE_API_KEY=your_key (Linux/Mac) or set GOOGLE_API_KEY=your_key (Windows)"
+        )
+    
+    # Configure Gemini with API key (always configure to ensure it's set)
+    genai.configure(api_key=api_key)
+    return api_key
+
+# ------------------ GEMINI CLIENT INIT ------------------
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        if genai is None:
+            raise ImportError("Install Google Generative AI with: pip install google-generativeai")
+        _configure_gemini_api_key()
+        
+        # Try different FREE model names in order of preference
+        # Only use free tier models
+        model_names = [
+            'gemini-1.5-flash-latest',  # Latest flash model (free)
+            'gemini-1.5-flash',         # Flash model (free tier)
+            'gemini-pro',               # Legacy free model
+        ]
+        
+        _gemini_client = None
+        last_error = None
+        
+        for model_name in model_names:
+            try:
+                _gemini_client = genai.GenerativeModel(model_name)
+                print(f"✅ Gemini client initialized (using {model_name}).")
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        
+        if _gemini_client is None:
+            # If all models failed, try to list ALL available models and find one that works
+            try:
+                print("⚠️ All predefined models failed. Listing available Gemini models...")
+                available_models = []
+                for model in genai.list_models():
+                    if 'generateContent' in model.supported_generation_methods:
+                        model_name = model.name.replace('models/', '')
+                        available_models.append(model_name)
+                        print(f"   Available model: {model_name}")
+                        
+                        # Try to use any available model (prioritize flash models for free tier)
+                        try:
+                            _gemini_client = genai.GenerativeModel(model_name)
+                            print(f"✅ Gemini client initialized (using {model_name}).")
+                            break
+                        except Exception as test_error:
+                            # If initialization fails, try next model
+                            continue
+                
+                if _gemini_client is None and available_models:
+                    print(f"⚠️ Found {len(available_models)} models but none worked. Trying first available model anyway...")
+                    try:
+                        _gemini_client = genai.GenerativeModel(available_models[0])
+                        print(f"✅ Gemini client initialized (using {available_models[0]} - may fail on first use).")
+                    except:
+                        pass
+            except Exception as list_error:
+                print(f"⚠️ Could not list models: {list_error}")
+            
+            if _gemini_client is None:
+                raise RuntimeError(
+                    f"Failed to initialize Gemini client with any model. "
+                    f"Last error: {last_error}. "
+                    f"Please check your GOOGLE_API_KEY and available models. "
+                    f"Visit https://ai.google.dev/gemini-api/docs/models to see available models."
+                )
+    return _gemini_client
+
+# ------------------ GEMINI GENERATION ------------------
+def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
+    """Generate text using Google Gemini API with fallback to different models"""
+    global _gemini_client
+    
+    # Ensure API key is configured first
+    try:
+        _configure_gemini_api_key()
+    except ValueError as key_error:
+        raise RuntimeError(f"Gemini API key not configured: {key_error}")
+    
+    # Try different model names if current one fails
+    # Try both free and available models
+    model_names = [
+        'gemini-1.5-flash-latest',  # Latest flash model
+        'gemini-1.5-flash',         # Flash model
+        'gemini-pro',               # Legacy model
+        'gemini-1.0-pro',           # Alternative model name
+        'gemini-1.5-flash-8b',      # Alternative flash variant
     ]
     
-    for pattern in response_patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE)
-        for match in matches:
-            decision_text = match.group(1).strip()
-            decision_text = re.sub(r'\s+', ' ', decision_text)
-            if len(decision_text) > 15:
-                decisions.append(Decision(
-                    text=decision_text,
-                    owner=None
-                ))
-    
-    # Remove duplicates
-    unique_actions = []
-    seen_descriptions = set()
-    for action in actions:
-        desc_lower = action.description.lower()
-        if desc_lower not in seen_descriptions:
-            unique_actions.append(action)
-            seen_descriptions.add(desc_lower)
-    
-    unique_decisions = []
-    seen_texts = set()
-    for decision in decisions:
-        text_lower = decision.text.lower()[:50]  # Compare first 50 chars
-        if text_lower not in seen_texts:
-            unique_decisions.append(decision)
-            seen_texts.add(text_lower)
-    
-    return unique_actions[:15], unique_decisions[:15]  # Limit to 15 each
-
-def extract_actions_and_decisions(sentences: List[str], diarization_data: List[Tuple[str, str]] = None) -> Tuple[List[ActionItem], List[Decision]]:
-    if AutoTokenizer is None or AutoModelForCausalLM is None:
-        print(
-            "Warning: Transformers library is not installed. Using rule-based extraction."
-        )
-        full_text = " ".join(sentences)
-        return _extract_with_rules(full_text)
-
+    # Also try to list and use any available model
     try:
-        # Build enhanced prompt with diarization data
-        content_section = "\n".join(sentences)
-        
-        if diarization_data:
-            speaker_info = "\nSpeaker Information:\n"
-            for speaker, text in diarization_data:
-                speaker_info += f"- {speaker}: {text}\n"
-            prompt = _EXTRACTION_PROMPT + f"\n\n{speaker_info}\n\nContent:\n{content_section}\n\nRespond with ONLY valid JSON:"
-        else:
-            prompt = _EXTRACTION_PROMPT + "\n\nContent:\n" + content_section + "\n\nRespond with ONLY valid JSON:"
-        
-        print("Extracting action items and decisions with local LLM...")
-        text = _generate_with_llm(prompt, max_new_tokens=1024)
-        
-        # Clean response text - remove markdown formatting if present
-        cleaned_text = text.strip()
-        if cleaned_text.startswith("```json"):
-            cleaned_text = cleaned_text[7:]  # Remove ```json
-        elif cleaned_text.startswith("```"):
-            cleaned_text = cleaned_text[3:]  # Remove ```
-        
-        if cleaned_text.endswith("```"):
-            cleaned_text = cleaned_text[:-3]  # Remove closing ```
-        
-        cleaned_text = cleaned_text.strip()
-        
-        # Try to extract JSON from the response if it's embedded in text
-        if not cleaned_text.startswith("{"):
-            # Try to find JSON object in the text
-            json_match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
-            if json_match:
-                cleaned_text = json_match.group(0)
-                
+        print("⚠️ Trying to list available Gemini models...")
+        for model in genai.list_models():
+            if 'generateContent' in model.supported_generation_methods:
+                model_name = model.name.replace('models/', '')
+                if model_name not in model_names:
+                    model_names.append(model_name)
+                    print(f"   Found model: {model_name}")
+    except Exception as list_error:
+        print(f"⚠️ Could not list models: {list_error}")
+    
+    # Prepare full prompt
+    full_prompt = (
+        "You extract structured action items and decisions from meeting transcripts.\n"
+        "Return ONLY valid JSON, no other text.\n\n"
+        + prompt
+    )
+    
+    last_error = None
+    
+    # First try with current model (if initialized)
+    if _gemini_client is not None:
         try:
-            data = json.loads(cleaned_text)
-            print(f"Raw LLM output: {len(data.get('action_items', []))} action items, {len(data.get('decisions', []))} decisions")
-            
-            # Validate and clean the data
-            data = _validate_and_clean_extraction(data)
-            print(f"After validation: {len(data.get('action_items', []))} action items, {len(data.get('decisions', []))} decisions")
-            
-        except json.JSONDecodeError as json_error:
-            print(f"Failed to parse JSON from extraction response. Error: {json_error}")
-            print(f"Using rule-based extraction as fallback...")
-            full_text = " ".join(sentences)
-            return _extract_with_rules(full_text)
-
-        decisions: List[Decision] = []
-        for d in data.get("decisions", []) or []:
-            decisions.append(Decision(text=d.get("text", ""), owner=d.get("owner")))
-
-        actions: List[ActionItem] = []
-        for a in data.get("action_items", []) or []:
-            actions.append(
-                ActionItem(
-                    description=a.get("description", ""),
-                    owner=a.get("owner"),
-                    due_date=a.get("due_date"),
-                    priority=a.get("priority"),
+            response = _gemini_client.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=max_tokens,
                 )
             )
+            return response.text.strip()
+        except Exception as e:
+            error_str = str(e).lower()
+            # If it's a 404 or model not found error, try other models
+            if "404" in error_str or "not found" in error_str:
+                print(f"⚠️ Model not found, trying other models...")
+                last_error = e
+                # Reset client to try other models
+                _gemini_client = None
+            else:
+                # Other errors - raise immediately
+                if "api key" in error_str or "authentication" in error_str or "403" in error_str or "401" in error_str:
+                    raise ValueError(f"Gemini API key error: {e}")
+                raise RuntimeError(f"Gemini API error: {e}")
+    
+    # Try other models (API key already configured above)
+    for model_name in model_names:
+        try:
+            # Ensure API key is configured before creating each model
+            _configure_gemini_api_key()
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=max_tokens,
+                )
+            )
+            # Save working model for next time
+            _gemini_client = model
+            print(f"✅ Using Gemini model: {model_name}")
+            return response.text.strip()
+        except Exception as e:
+            error_str = str(e).lower()
+            if "404" in error_str or "not found" in error_str:
+                last_error = e
+                continue
+            elif "api key" in error_str or "authentication" in error_str or "403" in error_str or "401" in error_str or "no api_key" in error_str or "no api key" in error_str:
+                # API key error - try to reconfigure and retry once
+                try:
+                    _configure_gemini_api_key()
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(
+                        full_prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.1,
+                            max_output_tokens=max_tokens,
+                        )
+                    )
+                    _gemini_client = model
+                    print(f"✅ Using Gemini model: {model_name} (after reconfiguring API key)")
+                    return response.text.strip()
+                except:
+                    raise ValueError(f"Gemini API key error: {e}")
+            else:
+                # Other error - might work, but log it
+                last_error = e
+                continue
+    
+    # All predefined models failed - try listing and using ALL available models
+    if last_error:
+        try:
+            print("⚠️ All predefined models failed. Listing ALL available Gemini models...")
+            available_models = []
+            for model in genai.list_models():
+                if 'generateContent' in model.supported_generation_methods:
+                    model_name = model.name.replace('models/', '')
+                    if model_name not in model_names:  # Avoid retrying models we already tried
+                        available_models.append(model_name)
+            
+            # Try all available models
+            for model_name in available_models:
+                try:
+                    _configure_gemini_api_key()
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(
+                        full_prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.1,
+                            max_output_tokens=max_tokens,
+                        )
+                    )
+                    # Save working model for next time
+                    _gemini_client = model
+                    print(f"✅ Using Gemini model: {model_name} (from list)")
+                    return response.text.strip()
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "404" in error_str or "not found" in error_str:
+                        continue
+                    elif "api key" in error_str or "authentication" in error_str:
+                        raise ValueError(f"Gemini API key error: {e}")
+                    else:
+                        # Other error - might be transient, try next
+                        continue
+        except Exception as list_error:
+            print(f"⚠️ Could not list or use additional models: {list_error}")
+    
+    # All models failed
+    raise RuntimeError(
+        f"Gemini API error: All models failed. Last error: {last_error}. "
+        f"Please check your GOOGLE_API_KEY and available models. "
+        f"Visit https://ai.google.dev/gemini-api/docs/models to see available models."
+    )
 
-        # If LLM returned insufficient results, combine with rule-based
-        if len(actions) < 3 or len(decisions) < 2:
-            print(f"LLM results seem incomplete, augmenting with rule-based extraction...")
-            full_text = " ".join(sentences)
-            rule_actions, rule_decisions = _extract_with_rules(full_text)
+# ------------------ LLM WRAPPER WITH FALLBACK ------------------
+def _generate_with_llm(prompt: str, max_tokens: int = 1500) -> str:
+    """Generate text with OpenAI API, fallback to Gemini if API key expired/invalid"""
+    # Try OpenAI API first
+    if OpenAI is not None and settings.openai_api_key:
+        try:
+            client = _get_openai_client()
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You extract structured action items and decisions from meeting transcripts. Return ONLY valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            # Check if it's an API key related error
+            error_str = str(e).lower()
             
-            # Merge results - add rule-based items that aren't duplicates
-            existing_descriptions = {a.description.lower() for a in actions}
-            for rule_action in rule_actions:
-                if rule_action.description.lower() not in existing_descriptions:
-                    actions.append(rule_action)
-                    existing_descriptions.add(rule_action.description.lower())
+            # Check for authentication/key errors
+            is_auth_error = (
+                (AuthenticationError is not None and isinstance(e, AuthenticationError)) or
+                (PermissionDeniedError is not None and isinstance(e, PermissionDeniedError)) or
+                any(keyword in error_str for keyword in ["api key", "authentication", "invalid", "expired", "unauthorized", "permission denied", "insufficient_quota", "quota"]) or
+                "401" in error_str or
+                "403" in error_str or
+                "429" in error_str
+            )
             
-            existing_decision_texts = {d.text.lower()[:50] for d in decisions}
-            for rule_decision in rule_decisions:
-                if rule_decision.text.lower()[:50] not in existing_decision_texts:
-                    decisions.append(rule_decision)
-                    existing_decision_texts.add(rule_decision.text.lower()[:50])
-            
-            print(f"After augmentation: {len(actions)} action items, {len(decisions)} decisions")
-
-        return actions, decisions
-        
+            if is_auth_error:
+                # API key expired, invalid, or quota exceeded - fallback to Gemini
+                print(f"⚠️ OpenAI API error ({e}). Falling back to Gemini...")
+                return _generate_with_gemini(prompt, max_tokens)
+            elif isinstance(e, ValueError) and "Missing OPENAI_API_KEY" in str(e):
+                # Missing API key - try Gemini
+                print(f"⚠️ OpenAI API key not found. Using Gemini...")
+                return _generate_with_gemini(prompt, max_tokens)
+            elif APIError is not None and isinstance(e, APIError):
+                # Other API errors - try Gemini as fallback
+                print(f"⚠️ OpenAI API error ({e}). Falling back to Gemini...")
+                try:
+                    return _generate_with_gemini(prompt, max_tokens)
+                except Exception as gemini_error:
+                    print(f"⚠️ Gemini also failed: {gemini_error}")
+                    raise RuntimeError(f"Both OpenAI API and Gemini failed. Please check your setup.")
+            else:
+                # Re-raise if it's an unexpected error
+                raise
+    
+    # No OpenAI API key or OpenAI not available - use Gemini
+    print(f"ℹ️ Using Gemini API...")
+    try:
+        return _generate_with_gemini(prompt, max_tokens)
     except Exception as e:
-        print(f"Error in extraction: {e}")
-        print("Using rule-based extraction as fallback...")
-        full_text = " ".join(sentences)
-        return _extract_with_rules(full_text)
+        print(f"⚠️ Gemini failed: {e}")
+        raise RuntimeError(f"Gemini API failed: {e}")
+
+# ------------------ CLEAN JSON ------------------
+def _try_parse_json(raw_text: str):
+    raw = raw_text.strip().replace("```json", "").replace("```", "").strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON found in model output.")
+    return json.loads(match.group(0))
+
+# ------------------ MAIN EXTRACT FUNCTION ------------------
+def extract_actions_and_decisions(sentences: List[str], diarization_data: List[Tuple[str, str]] = None) -> Tuple[List[ActionItem], List[Decision]]:
+    """Extract all action items and decisions using OpenAI API -> Gemini fallback"""
+    text = " ".join(sentences)
+    prompt = _EXTRACTION_PROMPT + "\n" + text.strip()
+
+    try:
+        print("🚀 Extracting with LLM...")
+        raw_response = _generate_with_llm(prompt)
+        data = _try_parse_json(raw_response)
+    except Exception as e:
+        print(f"❌ LLM extraction failed ({e}).")
+        raise RuntimeError(f"Failed to extract actions and decisions: {e}")
+
+    # --- Validate ---
+    action_items, decisions = [], []
+    for a in data.get("action_items", []):
+        if not a.get("description"):
+            continue
+        action_items.append(ActionItem(
+            description=a["description"].strip(),
+            owner=(a.get("owner") or None),
+            due_date=(a.get("due_date") or None),
+            priority=(a.get("priority") or None)
+        ))
+    for d in data.get("decisions", []):
+        if not d.get("text"):
+            continue
+        decisions.append(Decision(
+            text=d["text"].strip(),
+            owner=(d.get("owner") or None)
+        ))
+
+    print(f"✅ Extracted {len(action_items)} action items, {len(decisions)} decisions.")
+    return action_items[:25], decisions[:25]

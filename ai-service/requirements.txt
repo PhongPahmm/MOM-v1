@@ -13,7 +13,13 @@ accelerate>=0.24.0
 bitsandbytes>=0.41.0
 openai-whisper>=20231117
 sentencepiece>=0.1.99
-protobuf>=3.20.0
+protobuf>=3.20.0,<4.0.0
+
+# OpenAI API
+openai>=1.0.0
+
+# Google Generative AI (Gemini)
+google-generativeai>=0.3.0
 
 # Utils
 numpy==2.1.1

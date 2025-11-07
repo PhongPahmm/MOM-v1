@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import traceback
+import json
 
 from services.stt import transcribe_audio
 from services.clean import clean_transcript
@@ -13,6 +14,14 @@ from services.diarization import diarize
 from services.extraction import extract_actions_and_decisions
 from schemas.mom import ActionItem, Decision
 from core.config import settings
+
+try:
+    from services.vector_db import add_training_example, get_similar_examples, save_vector_db, load_vector_db
+except ImportError:
+    add_training_example = None
+    get_similar_examples = None
+    save_vector_db = None
+    load_vector_db = None
 
 app = FastAPI(title="AI Service API", version="1.0.0")
 
@@ -27,6 +36,74 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "AI Service"}
+
+@app.on_event("startup")
+async def startup_event():
+    """Load vector database on startup"""
+    if load_vector_db:
+        try:
+            load_vector_db()
+        except Exception as e:
+            print(f"Could not load vector database: {e}")
+
+@app.post("/vector-db/add-example")
+async def add_example(
+    text: str = Form(...),
+    action_items: str = Form(...),  # JSON string
+    decisions: str = Form(...)  # JSON string
+):
+    """Add a training example to the vector database"""
+    if not add_training_example:
+        raise HTTPException(status_code=501, detail="Vector database not available")
+    
+    try:
+        action_items_list = json.loads(action_items)
+        decisions_list = json.loads(decisions)
+        
+        add_training_example(text, action_items_list, decisions_list)
+        save_vector_db()
+        
+        return {"status": "success", "message": "Training example added"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add example: {str(e)}")
+
+@app.post("/vector-db/search")
+async def search_examples(
+    text: str = Form(...),
+    top_k: Optional[int] = Form(default=None)
+):
+    """Search for similar examples in vector database"""
+    if not get_similar_examples:
+        raise HTTPException(status_code=501, detail="Vector database not available")
+    
+    try:
+        examples = get_similar_examples(text, top_k=top_k)
+        return {
+            "count": len(examples),
+            "examples": [
+                {
+                    "text": ex["text"],
+                    "action_items": ex["action_items"],
+                    "decisions": ex["decisions"],
+                    "similarity_score": ex.get("similarity_score", 0.0)
+                }
+                for ex in examples
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+@app.post("/vector-db/save")
+async def save_db():
+    """Save vector database to disk"""
+    if not save_vector_db:
+        raise HTTPException(status_code=501, detail="Vector database not available")
+    
+    try:
+        save_vector_db()
+        return {"status": "success", "message": "Vector database saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save: {str(e)}")
 
 @app.post("/speech-to-text")
 async def speech_to_text(
@@ -98,23 +175,33 @@ async def extract_content(
         segments = diarize(cleaned)
         actions, decisions = extract_actions_and_decisions(sentences, segments)
         
+        # Ensure we always return valid lists
+        if actions is None:
+            actions = []
+        if decisions is None:
+            decisions = []
+        
         return {
             "action_items": [
                 {
-                    "description": action.description,
-                    "owner": action.owner,
-                    "due_date": action.due_date,
-                    "priority": action.priority
+                    "description": str(action.description) if action.description else "",
+                    "owner": action.owner if action.owner else None,
+                    "due_date": action.due_date if action.due_date else None,
+                    "priority": action.priority if action.priority else None
                 } for action in actions
             ],
             "decisions": [
                 {
-                    "text": decision.text,
-                    "owner": decision.owner
+                    "text": str(decision.text) if decision.text else "",
+                    "owner": decision.owner if decision.owner else None
                 } for decision in decisions
             ]
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Error in extract endpoint: {type(e).__name__}: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
 @app.post("/process-full")
@@ -153,25 +240,33 @@ async def process_full(
         structured_summary = summarize(sentences, language)
         segments = diarize(cleaned)
         actions, decisions = extract_actions_and_decisions(sentences, segments)
+        
+        # Ensure we always return valid lists
+        if actions is None:
+            actions = []
+        if decisions is None:
+            decisions = []
+        if segments is None:
+            segments = []
 
         return {
             "transcript": cleaned,
-            "structured_summary": structured_summary,
+            "structured_summary": structured_summary if structured_summary else {},
             "action_items": [
                 {
-                    "description": action.description,
-                    "owner": action.owner,
-                    "due_date": action.due_date,
-                    "priority": action.priority
+                    "description": str(action.description) if action.description else "",
+                    "owner": action.owner if action.owner else None,
+                    "due_date": action.due_date if action.due_date else None,
+                    "priority": action.priority if action.priority else None
                 } for action in actions
             ],
             "decisions": [
                 {
-                    "text": decision.text,
-                    "owner": decision.owner
+                    "text": str(decision.text) if decision.text else "",
+                    "owner": decision.owner if decision.owner else None
                 } for decision in decisions
             ],
-            "diarization": [{"speaker": speaker, "text": text} for speaker, text in segments]
+            "diarization": [{"speaker": str(speaker), "text": str(text)} for speaker, text in segments]
         }
     
     except HTTPException:

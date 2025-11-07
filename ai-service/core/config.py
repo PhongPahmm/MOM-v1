@@ -8,27 +8,32 @@ class Settings(BaseSettings):
     app_port: int = 8001
     
     # Local Model Settings
-    whisper_model_size: str = "small"  # Options: tiny, base, small, medium, large
+    # Whisper model size - sử dụng tiny để tiết kiệm tài nguyên
+    whisper_model_size: str = "base"  # Options: tiny, base, small, medium, large
     
-    # LLM Model Options (choose based on your hardware):
-    # - "google/gemma-2b-it": Lightweight, works on CPU, faster but less accurate
-    # - "mistralai/Mistral-7B-Instruct-v0.2": Better quality, needs more RAM (recommended)
-    # - "meta-llama/Llama-2-7b-chat-hf": Good alternative, needs HuggingFace token
-    # - "TheBloke/Mistral-7B-Instruct-v0.2-GGUF": Quantized version, good balance
-    llm_model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"
+    # Embedding Model for Vector-based Extraction (optional)
+    # Options: "sentence-transformers/all-MiniLM-L6-v2" (fast, lightweight)
+    #          "sentence-transformers/all-mpnet-base-v2" (better quality, slower)
+    #          "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" (multilingual)
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     
-    # Use rule-based extraction as fallback when LLM fails
-    use_rule_based_fallback: bool = True
+    # Vector Database Settings
+    use_vector_extraction: bool = True  # Use vector-based extraction instead of prompt
+    vector_similarity_threshold: float = 0.7  # Minimum similarity score for retrieval
+    top_k_examples: int = 5  # Number of similar examples to retrieve
     
-    # Legacy API keys (not used anymore, kept for backward compatibility)
-    openai_api_key: Optional[str] = None
-    google_api_key: Optional[str] = None
+    # API Keys
+    # OpenAI API Key - ưu tiên sử dụng, nếu hết hạn sẽ fallback sang Gemini
+    openai_api_key: Optional[str] = None  # Đọc từ env variable OPENAI_API_KEY
+    # Google API Key - fallback khi OpenAI API hết hạn
+    google_api_key: Optional[str] = None  # Đọc từ env variable GOOGLE_API_KEY (cho Gemini)
     google_cloud_credentials_path: Optional[str] = None
     speechmatics_api_key: Optional[str] = None
 
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
+        "case_sensitive": False,
         "extra": "ignore",
     }
 

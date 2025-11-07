@@ -1,21 +1,26 @@
 from typing import List, Dict, Any
 import json
-import time
 import re
 
 try:
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    import torch
+    from openai import OpenAI
+    from openai import AuthenticationError, PermissionDeniedError, APIError
 except ImportError:
-    AutoTokenizer = None
-    AutoModelForCausalLM = None
-    torch = None
+    OpenAI = None
+    AuthenticationError = None
+    PermissionDeniedError = None
+    APIError = None
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 from core.config import settings
 
-# Global model cache
-_llm_model = None
-_llm_tokenizer = None
+# Global client cache
+_openai_client = None
+_gemini_client = None
 
 _SYSTEM_PROMPT = (
     "You are a precise meeting minutes assistant. Extract structured information from meeting transcripts.\n"
@@ -71,312 +76,403 @@ _SYSTEM_PROMPT = (
     "Return valid JSON only. No markdown code blocks.\n"
 )
 
-def _get_llm_model():
-    """Lazy load LLM model to avoid loading on import"""
-    global _llm_model, _llm_tokenizer
-    
-    if _llm_model is None or _llm_tokenizer is None:
-        if AutoTokenizer is None or AutoModelForCausalLM is None or torch is None:
-            raise ImportError(
-                "Transformers or PyTorch is not installed. Please install with: pip install transformers torch"
-            )
-        
-        model_name = settings.llm_model_name or "google/gemma-2b-it"
-        print(f"Loading LLM model ({model_name})... This may take a while on first run.")
-        
-        _llm_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        _llm_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True
-        )
-        
-        if not torch.cuda.is_available():
-            _llm_model = _llm_model.to("cpu")
-        
-        print(f"LLM model loaded successfully.")
-    
-    return _llm_model, _llm_tokenizer
+# ------------------ OPENAI CLIENT INIT ------------------
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        if OpenAI is None:
+            raise ImportError("Install OpenAI with: pip install openai")
+        api_key = settings.openai_api_key
+        if not api_key:
+            # Try to get from environment variable
+            import os
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("Missing OPENAI_API_KEY in .env or environment.")
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
 
-def _generate_with_llm(prompt: str, max_new_tokens: int = 2048) -> str:
-    """Generate text using local LLM with optimized parameters for accuracy"""
-    model, tokenizer = _get_llm_model()
+# ------------------ CONFIGURE GEMINI API KEY ------------------
+def _configure_gemini_api_key():
+    """Ensure Gemini API key is configured"""
+    import os
+    # Try multiple sources for API key
+    api_key = None
     
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=6144)
+    # 1. Try from settings (from .env file via pydantic)
+    api_key = settings.google_api_key
     
-    if torch.cuda.is_available():
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    # 2. Try from environment variable (direct)
+    if not api_key:
+        api_key = os.getenv("GOOGLE_API_KEY")
     
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=0.3,  # Lower temperature for more accurate output
-            do_sample=True,
-            top_p=0.85,
-            top_k=40,
-            repetition_penalty=1.1,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id
-        )
-    
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Remove the input prompt from response
-    if response.startswith(prompt):
-        response = response[len(prompt):].strip()
-    
-    return response
-
-def summarize(sentences: List[str], language: str = "vi") -> Dict[str, Any]:
-    """
-    Generate structured meeting minutes from sentences using local LLM
-    Returns a dictionary with structured content
-    """
-    if AutoTokenizer is None or AutoModelForCausalLM is None:
-        print(
-            "Warning: Transformers library is not installed. "
-            "Please install it with: pip install transformers torch"
-        )
-        return _get_default_structured_content(sentences)
-
-    try:
-        prompt = (
-            f"Language: {language}. "
-            + _SYSTEM_PROMPT
-            + "\n\nContent:\n"
-            + "\n".join(sentences)
-            + "\n\nRespond with ONLY valid JSON, no other text:"
-        )
-        
-        print("Generating meeting minutes with local LLM...")
-        text = _generate_with_llm(prompt, max_new_tokens=2048)
-        
-        if text:
-            # Try to parse JSON response
-            try:
-                # Clean the response text (remove markdown formatting if present)
-                cleaned_text = text.strip()
-                if cleaned_text.startswith("```json"):
-                    cleaned_text = cleaned_text[7:]
-                if cleaned_text.startswith("```"):
-                    cleaned_text = cleaned_text[3:]
-                if cleaned_text.endswith("```"):
-                    cleaned_text = cleaned_text[:-3]
-                
-                cleaned_text = cleaned_text.strip()
-                
-                # Try to extract JSON from text if embedded
-                import re
-                json_match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
-                if json_match:
-                    cleaned_text = json_match.group(0)
-                
-                structured_data = json.loads(cleaned_text)
-                print("Successfully parsed meeting minutes JSON")
-                return structured_data
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse JSON response: {e}")
-                return _get_fallback_structured_content(text, sentences)
-        
-        return _get_default_structured_content(sentences)
-        
-    except Exception as e:
-        print(f"Error in summarization: {e}")
-        return _get_default_structured_content(sentences)
-
-def _extract_with_rules(text: str) -> Dict[str, Any]:
-    """Rule-based extraction as fallback"""
-    # Extract title from first meaningful sentence
-    sentences = [s.strip() for s in text.split('.') if s.strip()]
-    title = "Meeting Minutes"
-    if sentences:
-        first_sentence = sentences[0][:150]
-        if "policy review" in first_sentence.lower():
-            title = "Policy Review Meeting"
-        elif "remote work" in first_sentence.lower() or "hybrid work" in first_sentence.lower():
-            title = "Remote Work Policy Meeting"
-        elif "project" in first_sentence.lower():
-            title = "Project Discussion Meeting"
-        elif "team" in first_sentence.lower():
-            title = "Team Meeting"
-        elif "meeting" in first_sentence.lower():
-            # Extract the topic before "meeting"
-            match = re.search(r'(\w+(?:\s+\w+){0,3})\s+meeting', first_sentence, re.IGNORECASE)
-            if match:
-                title = match.group(0).title()
-        else:
-            # Use meaningful words from purpose
-            purpose_match = re.search(r'purpose.*?is to\s+(.{10,60}?)(?:\.|$)', text, re.IGNORECASE)
-            if purpose_match:
-                purpose = purpose_match.group(1).strip()
-                title = purpose[:50].title() + " - Meeting"
-    
-    # Extract dates and times
-    date_patterns = [
-        r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
-        r'\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b',
-        r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{1,2},?\s+\d{4}\b'
-    ]
-    date_found = "To be determined"
-    for pattern in date_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            date_found = match.group(0)
-            break
-    
-    time_patterns = [
-        r'\b\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)\b',
-        r'\b\d{1,2}\s*(?:am|pm|AM|PM)\b'
-    ]
-    time_found = "To be determined"
-    for pattern in time_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            time_found = match.group(0)
-            break
-    
-    # Extract attendants - be more selective
-    attendants = []
-    # Look for proper names with context (not just any capitalized words)
-    name_patterns = [
-        r'\b(?:Mr|Ms|Mrs|Dr|Professor)\.?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b',
-    ]
-    
-    for pattern in name_patterns:
-        matches = re.findall(pattern, text)
-        attendants.extend(matches)
-    
-    # Also look for names in specific contexts
-    context_patterns = [
-        r'(?:presented by|led by|facilitated by|with)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)',
-        r'([A-Z][a-z]+\s+[A-Z][a-z]+)\s+(?:will|presented|discussed|mentioned)'
-    ]
-    
-    for pattern in context_patterns:
-        matches = re.findall(pattern, text)
-        attendants.extend(matches[:5])
-    
-    # Remove duplicates and common false positives
-    attendants = list(set(attendants))
-    # Filter out department names and common false positives
-    false_positives = ['Good Morning', 'Thank You', 'In Response', 'To Solve', 'Action Items', 
-                      'Before Closing', 'Next Review', 'Remote Work', 'Many Employees']
-    attendants = [a for a in attendants if a not in false_positives and len(a) < 30]
-    attendants = attendants[:10]  # Limit to 10
-    
-    # Extract project name - only if explicitly mentioned
-    project_name = "To be determined"
-    project_patterns = [
-        r'(?:project|initiative|program)\s+(?:called|named|titled)\s+["\']?([A-Z][A-Za-z0-9\s]+?)["\']?(?:\s|\.|\,)',
-        r'(?:the|a)\s+([A-Z][A-Za-z0-9\s]{3,30}?)\s+project',
-    ]
-    for pattern in project_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            candidate = match.group(1).strip()
-            # Validate it's not a verb or common word
-            if not any(word in candidate.lower() for word in ['will', 'should', 'must', 'can', 'the', 'a', 'an']):
-                project_name = candidate
+    # 3. Try from os.environ directly (case-insensitive)
+    if not api_key:
+        for key, value in os.environ.items():
+            if key.upper() == "GOOGLE_API_KEY":
+                api_key = value
                 break
     
-    # Extract customer - only if explicitly mentioned
-    customer = "To be determined"
-    customer_patterns = [
-        r'(?:client|customer)\s+(?:is|called|named)\s+["\']?([A-Z][A-Za-z0-9\s&]+?)["\']?(?:\s|\.|\,)',
-        r'(?:for|with)\s+(?:client|customer)\s+([A-Z][A-Za-z][A-Za-z0-9\s&]+)',
+    if not api_key:
+        raise ValueError(
+            "Missing GOOGLE_API_KEY. Please set it in:\n"
+            "1. .env file: GOOGLE_API_KEY=your_key\n"
+            "2. Environment variable: export GOOGLE_API_KEY=your_key (Linux/Mac) or set GOOGLE_API_KEY=your_key (Windows)"
+        )
+    
+    # Configure Gemini with API key (always configure to ensure it's set)
+    genai.configure(api_key=api_key)
+    return api_key
+
+# ------------------ GEMINI CLIENT INIT ------------------
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        if genai is None:
+            raise ImportError("Install Google Generative AI with: pip install google-generativeai")
+        _configure_gemini_api_key()
+        
+        # Try different FREE model names in order of preference
+        # Only use free tier models
+        model_names = [
+            'gemini-1.5-flash-latest',  # Latest flash model (free)
+            'gemini-1.5-flash',         # Flash model (free tier)
+            'gemini-pro',               # Legacy free model
+        ]
+        
+        _gemini_client = None
+        last_error = None
+        
+        for model_name in model_names:
+            try:
+                _gemini_client = genai.GenerativeModel(model_name)
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        
+        if _gemini_client is None:
+            try:
+                available_models = []
+                for model in genai.list_models():
+                    if 'generateContent' in model.supported_generation_methods:
+                        model_name = model.name.replace('models/', '')
+                        available_models.append(model_name)
+                        try:
+                            _gemini_client = genai.GenerativeModel(model_name)
+                            break
+                        except Exception:
+                            continue
+                
+                if _gemini_client is None and available_models:
+                    try:
+                        _gemini_client = genai.GenerativeModel(available_models[0])
+                    except:
+                        pass
+            except Exception:
+                pass
+            
+            if _gemini_client is None:
+                raise RuntimeError(
+                    f"Failed to initialize Gemini client with any model. "
+                    f"Last error: {last_error}. "
+                    f"Please check your GOOGLE_API_KEY and available models. "
+                    f"Visit https://ai.google.dev/gemini-api/docs/models to see available models."
+                )
+    return _gemini_client
+
+# ------------------ LLM GENERATION WITH FALLBACK ------------------
+def _generate_with_llm(prompt: str, max_tokens: int = 2048) -> str:
+    """Generate text with OpenAI API, fallback to Gemini if API key expired/invalid"""
+    # Try OpenAI API first
+    if OpenAI is not None and settings.openai_api_key:
+        try:
+            client = _get_openai_client()
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a precise meeting minutes assistant. Extract structured information from meeting transcripts. Return ONLY valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            # Check if it's an API key related error
+            error_str = str(e).lower()
+            
+            # Check for authentication/key errors
+            is_auth_error = (
+                (AuthenticationError is not None and isinstance(e, AuthenticationError)) or
+                (PermissionDeniedError is not None and isinstance(e, PermissionDeniedError)) or
+                any(keyword in error_str for keyword in ["api key", "authentication", "invalid", "expired", "unauthorized", "permission denied", "insufficient_quota", "quota"]) or
+                "401" in error_str or
+                "403" in error_str or
+                "429" in error_str
+            )
+            
+            if is_auth_error:
+                return _generate_with_gemini(prompt, max_tokens)
+            elif isinstance(e, ValueError) and "Missing OPENAI_API_KEY" in str(e):
+                return _generate_with_gemini(prompt, max_tokens)
+            elif APIError is not None and isinstance(e, APIError):
+                try:
+                    return _generate_with_gemini(prompt, max_tokens)
+                except Exception:
+                    raise RuntimeError(f"Both OpenAI API and Gemini failed. Please check your setup.")
+            else:
+                # Re-raise if it's an unexpected error
+                raise
+    
+    try:
+        return _generate_with_gemini(prompt, max_tokens)
+    except Exception as e:
+        raise RuntimeError(f"Gemini API failed: {e}")
+
+# ------------------ GEMINI GENERATION ------------------
+def _generate_with_gemini(prompt: str, max_tokens: int = 2048) -> str:
+    """Generate text using Google Gemini API with fallback to different models"""
+    global _gemini_client
+    
+    # Ensure API key is configured first
+    try:
+        _configure_gemini_api_key()
+    except ValueError as key_error:
+        raise RuntimeError(f"Gemini API key not configured: {key_error}")
+    
+    # Try different model names if current one fails
+    # Try both free and available models
+    model_names = [
+        'gemini-1.5-flash-latest',  # Latest flash model
+        'gemini-1.5-flash',         # Flash model
+        'gemini-pro',               # Legacy model
+        'gemini-1.0-pro',           # Alternative model name
+        'gemini-1.5-flash-8b',      # Alternative flash variant
     ]
-    for pattern in customer_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            customer = match.group(1).strip()[:50]
-            break
     
-    # Generate table of contents from key topics found in text
-    topics = []
-    topic_mapping = {
-        'policy': 'Policy Framework',
-        'guideline': 'Guidelines',
-        'remote work': 'Remote Work',
-        'flexibility': 'Work Flexibility',
-        'collaboration': 'Team Collaboration',
-        'well-being': 'Employee Well-being',
-        'equipment': 'Equipment & Tools',
-        'productivity': 'Productivity Measurement',
-        'communication': 'Communication',
-        'security': 'Security & Compliance',
-        'culture': 'Company Culture',
-        'implementation': 'Implementation Plan',
-        'action items': 'Action Items',
-        'feedback': 'Feedback',
-        'budget': 'Budget'
-    }
+    try:
+        for model in genai.list_models():
+            if 'generateContent' in model.supported_generation_methods:
+                model_name = model.name.replace('models/', '')
+                if model_name not in model_names:
+                    model_names.append(model_name)
+    except Exception:
+        pass
     
-    for keyword, topic_name in topic_mapping.items():
-        if keyword.lower() in text.lower():
-            topics.append(topic_name)
-    
-    if not topics:
-        # Default structure
-        topics = ["Introduction", "Discussion", "Decisions", "Action Items", "Conclusion"]
-    
-    # Create main content summary with better structure
-    # Split by major sections
-    summary_parts = []
-    
-    # Introduction (first 100 words)
-    words = text.split()
-    if len(words) > 100:
-        summary_parts.append(" ".join(words[:100]))
-    
-    # Key decisions
-    decision_section = re.search(
-        r'((?:proposal is|decided to|agreed to|consensus was).{50,300}?)(?:\.|(?=[A-Z]))',
-        text,
-        re.IGNORECASE
+    # Prepare full prompt with system instructions
+    full_prompt = (
+        "You are a precise meeting minutes assistant. Extract structured information from meeting transcripts.\n"
+        "CRITICAL: Return ONLY valid JSON. No markdown, no text before/after. Just pure JSON.\n\n"
+        + prompt
     )
-    if decision_section:
-        summary_parts.append("Key Decision: " + decision_section.group(1).strip())
     
-    # Action items summary
-    action_section = re.search(
-        r'Action items were assigned\.(.*?)(?:Before closing|The next|$)',
-        text,
-        re.IGNORECASE | re.DOTALL
+    last_error = None
+    
+    # First try with current model (if initialized)
+    if _gemini_client is not None:
+        try:
+            response = _gemini_client.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=max_tokens,
+                )
+            )
+            return response.text.strip()
+        except Exception as e:
+            error_str = str(e).lower()
+            if "404" in error_str or "not found" in error_str:
+                last_error = e
+                _gemini_client = None
+            else:
+                # Other errors - raise immediately
+                if "api key" in error_str or "authentication" in error_str or "403" in error_str or "401" in error_str:
+                    raise ValueError(f"Gemini API key error: {e}")
+                raise RuntimeError(f"Gemini API error: {e}")
+    
+    # Try other models (API key already configured above)
+    for model_name in model_names:
+        try:
+            # Ensure API key is configured before creating each model
+            _configure_gemini_api_key()
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=max_tokens,
+                )
+            )
+            _gemini_client = model
+            return response.text.strip()
+        except Exception as e:
+            error_str = str(e).lower()
+            if "404" in error_str or "not found" in error_str:
+                last_error = e
+                continue
+            elif "api key" in error_str or "authentication" in error_str or "403" in error_str or "401" in error_str or "no api_key" in error_str or "no api key" in error_str:
+                # API key error - try to reconfigure and retry once
+                try:
+                    _configure_gemini_api_key()
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(
+                        full_prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.1,
+                            max_output_tokens=max_tokens,
+                        )
+                    )
+                    _gemini_client = model
+                    return response.text.strip()
+                except:
+                    raise ValueError(f"Gemini API key error: {e}")
+            else:
+                # Other error - might work, but log it
+                last_error = e
+                continue
+    
+    if last_error:
+        try:
+            available_models = []
+            for model in genai.list_models():
+                if 'generateContent' in model.supported_generation_methods:
+                    model_name = model.name.replace('models/', '')
+                    if model_name not in model_names:
+                        available_models.append(model_name)
+            
+            for model_name in available_models:
+                try:
+                    _configure_gemini_api_key()
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(
+                        full_prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.1,
+                            max_output_tokens=max_tokens,
+                        )
+                    )
+                    _gemini_client = model
+                    return response.text.strip()
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "404" in error_str or "not found" in error_str:
+                        continue
+                    elif "api key" in error_str or "authentication" in error_str:
+                        raise ValueError(f"Gemini API key error: {e}")
+                    else:
+                        continue
+        except Exception:
+            pass
+    
+    # All models failed
+    raise RuntimeError(
+        f"Gemini API error: All models failed. Last error: {last_error}. "
+        f"Please check your GOOGLE_API_KEY and available models. "
+        f"Visit https://ai.google.dev/gemini-api/docs/models to see available models."
     )
-    if action_section:
-        action_text = action_section.group(1).strip()
-        action_words = action_text.split()[:100]
-        summary_parts.append("Action Items: " + " ".join(action_words))
-    
-    main_content = " ".join(summary_parts) if summary_parts else " ".join(words[:500])
-    
-    return {
-        "title": title,
-        "date": date_found,
-        "time": time_found,
-        "attendants": attendants,
-        "project_name": project_name,
-        "customer": customer,
-        "table_of_content": topics[:12],
-        "main_content": main_content
-    }
 
-def _get_default_structured_content(sentences: List[str]) -> Dict[str, Any]:
-    """Fallback structured content when AI is not available"""
-    full_text = " ".join(sentences)
-    return _extract_with_rules(full_text)
-
-def _get_fallback_structured_content(ai_response: str, sentences: List[str]) -> Dict[str, Any]:
-    """Fallback when JSON parsing fails but we have AI response"""
-    return {
-        "title": "Meeting Minutes",
-        "date": "To be determined",
-        "time": "To be determined",
-        "attendants": [],
-        "project_name": "To be determined", 
-        "customer": "To be determined",
-        "table_of_content": ["Main Discussion Points"],
-        "main_content": ai_response if ai_response else " ".join(sentences[:5])
-    }
+# ------------------ MAIN SUMMARIZE FUNCTION ------------------
+def summarize(sentences: List[str], language: str = "vi") -> Dict[str, Any]:
+    """
+    Generate structured meeting minutes from sentences using OpenAI API (with fallback to Gemini)
+    Returns a dictionary with structured content
+    """
+    max_retries = 2
+    max_tokens = 4096  # Tăng từ 2048 lên 4096 để tránh response bị cắt
+    
+    for attempt in range(max_retries + 1):
+        try:
+            # Tạo prompt với yêu cầu JSON ngắn gọn hơn nếu retry
+            if attempt > 0:
+                prompt = (
+                    f"Language: {language}. "
+                    + "IMPORTANT: Keep JSON response SHORT and CONCISE. "
+                    + "Limit main_content to 300 words maximum. "
+                    + "Limit table_of_content to 5-7 items maximum.\n\n"
+                    + _SYSTEM_PROMPT
+                    + "\n\nContent:\n"
+                    + "\n".join(sentences)
+                    + "\n\nRespond with ONLY valid JSON, no other text. Keep it SHORT:"
+                )
+            else:
+                prompt = (
+                    f"Language: {language}. "
+                    + _SYSTEM_PROMPT
+                    + "\n\nContent:\n"
+                    + "\n".join(sentences)
+                    + "\n\nRespond with ONLY valid JSON, no other text:"
+                )
+            
+            text = _generate_with_llm(prompt, max_tokens=max_tokens)
+            
+            if text:
+                # Try to parse JSON response
+                try:
+                    # Clean the response text (remove markdown formatting if present)
+                    cleaned_text = text.strip()
+                    if cleaned_text.startswith("```json"):
+                        cleaned_text = cleaned_text[7:]
+                    if cleaned_text.startswith("```"):
+                        cleaned_text = cleaned_text[3:]
+                    if cleaned_text.endswith("```"):
+                        cleaned_text = cleaned_text[:-3]
+                    
+                    cleaned_text = cleaned_text.strip()
+                    
+                    # Try to extract JSON from text if embedded
+                    json_match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
+                    if json_match:
+                        cleaned_text = json_match.group(0)
+                    
+                    if not cleaned_text.rstrip().endswith('}'):
+                        if attempt < max_retries:
+                            continue
+                        else:
+                            # Tìm vị trí string bị cắt và đóng nó
+                            lines = cleaned_text.split('\n')
+                            fixed_lines = []
+                            in_string = False
+                            for i, line in enumerate(lines):
+                                fixed_lines.append(line)
+                                # Đếm dấu ngoặc kép (đơn giản)
+                                quote_count = line.count('"') - line.count('\\"')
+                                if quote_count % 2 == 1:
+                                    in_string = not in_string
+                            
+                            # Nếu đang trong string, đóng nó
+                            if in_string:
+                                fixed_lines[-1] = fixed_lines[-1].rstrip() + '"'
+                            
+                            # Đảm bảo kết thúc bằng }
+                            if not fixed_lines[-1].rstrip().endswith('}'):
+                                # Tìm dấu ngoặc nhọn cuối cùng
+                                last_brace = cleaned_text.rfind('}')
+                                if last_brace > 0:
+                                    cleaned_text = cleaned_text[:last_brace+1]
+                                else:
+                                    # Thêm } nếu không có
+                                    fixed_lines.append('}')
+                            
+                            cleaned_text = '\n'.join(fixed_lines)
+                    
+                    structured_data = json.loads(cleaned_text)
+                    return structured_data
+                except json.JSONDecodeError as e:
+                    if attempt < max_retries:
+                        continue
+                    else:
+                        raise RuntimeError(f"Failed to parse JSON from LLM response after {max_retries + 1} attempts: {e}")
+            
+            raise RuntimeError("LLM returned empty response")
+            
+        except RuntimeError as e:
+            if "Failed to parse JSON" in str(e) and attempt < max_retries:
+                continue
+            raise
+        except Exception as e:
+            if attempt < max_retries:
+                continue
+            raise RuntimeError(f"Failed to summarize meeting minutes: {e}")
+    
+    raise RuntimeError("Failed to summarize meeting minutes after all retry attempts")
