@@ -1,5 +1,6 @@
 import json
 import re
+from json import JSONDecodeError
 from typing import List, Tuple
 
 from schemas.mom import ActionItem, Decision
@@ -382,21 +383,47 @@ def _try_parse_json(raw_text: str):
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         raise ValueError("No JSON found in model output.")
-    return json.loads(match.group(0))
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError as exc:
+        raise JSONDecodeError(exc.msg, exc.doc, exc.pos)
 
 # ------------------ MAIN EXTRACT FUNCTION ------------------
 def extract_actions_and_decisions(sentences: List[str], diarization_data: List[Tuple[str, str]] = None) -> Tuple[List[ActionItem], List[Decision]]:
     """Extract all action items and decisions using OpenAI API -> Gemini fallback"""
     text = " ".join(sentences)
-    prompt = _EXTRACTION_PROMPT + "\n" + text.strip()
+    base_prompt = _EXTRACTION_PROMPT + "\n" + text.strip()
+    prompt = base_prompt
 
-    try:
-        print("🚀 Extracting with LLM...")
-        raw_response = _generate_with_llm(prompt)
-        data = _try_parse_json(raw_response)
-    except Exception as e:
-        print(f"❌ LLM extraction failed ({e}).")
-        raise RuntimeError(f"Failed to extract actions and decisions: {e}")
+    raw_response = ""
+    attempts = 0
+    max_attempts = 3
+
+    while attempts < max_attempts:
+        try:
+            print("🚀 Extracting with LLM...")
+            raw_response = _generate_with_llm(prompt)
+            data = _try_parse_json(raw_response)
+            break
+        except (ValueError, JSONDecodeError) as parse_error:
+            attempts += 1
+            trimmed_response = raw_response.strip().replace("\n", " ")[:400]
+            print(f"⚠️ JSON parse failed (attempt {attempts}/{max_attempts}): {parse_error}")
+            if trimmed_response:
+                print(f"🔍 Raw response (trimmed): {trimmed_response}")
+
+            if attempts >= max_attempts:
+                print(f"❌ LLM extraction failed after {attempts} attempts ({parse_error}).")
+                raise RuntimeError(f"Failed to extract actions and decisions: {parse_error}")
+
+            prompt = (
+                base_prompt
+                + "\n\nYour previous response was invalid JSON. "
+                  "Reply again using ONLY valid JSON that matches the required schema "
+                  "without additional text, comments, or trailing commas."
+            )
+    else:
+        raise RuntimeError("Failed to extract actions and decisions: Unknown error during parsing.")
 
     # --- Validate ---
     action_items, decisions = [], []
