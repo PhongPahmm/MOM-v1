@@ -102,12 +102,14 @@ def _get_gemini_client():
             raise ImportError("Install Google Generative AI with: pip install google-generativeai")
         _configure_gemini_api_key()
         
-        # Try different FREE model names in order of preference
-        # Only use free tier models
+        # Try different model names in order of preference
+        # Prioritize newer, faster models first
         model_names = [
-            'gemini-1.5-flash-latest',  # Latest flash model (free)
-            'gemini-1.5-flash',         # Flash model (free tier)
-            'gemini-pro',               # Legacy free model
+            'gemini-2.5-flash',         # Newest flash model (fastest)
+            'gemini-2.0-flash',         # Flash model v2
+            'gemini-1.5-flash-latest',  # Latest flash model
+            'gemini-1.5-flash',         # Flash model
+            'gemini-pro',               # Legacy model
         ]
         
         _gemini_client = None
@@ -173,26 +175,17 @@ def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
         raise RuntimeError(f"Gemini API key not configured: {key_error}")
     
     # Try different model names if current one fails
-    # Try both free and available models
+    # Prioritize newer, faster models first
     model_names = [
+        'gemini-2.5-flash',         # Newest flash model (fastest)
+        'gemini-2.0-flash',         # Flash model v2
         'gemini-1.5-flash-latest',  # Latest flash model
         'gemini-1.5-flash',         # Flash model
         'gemini-pro',               # Legacy model
-        'gemini-1.0-pro',           # Alternative model name
-        'gemini-1.5-flash-8b',      # Alternative flash variant
     ]
     
-    # Also try to list and use any available model
-    try:
-        print("⚠️ Trying to list available Gemini models...")
-        for model in genai.list_models():
-            if 'generateContent' in model.supported_generation_methods:
-                model_name = model.name.replace('models/', '')
-                if model_name not in model_names:
-                    model_names.append(model_name)
-                    print(f"   Found model: {model_name}")
-    except Exception as list_error:
-        print(f"⚠️ Could not list models: {list_error}")
+    # Skip listing models if we already have a working client
+    # Only list models if all predefined models fail (to save time)
     
     # Prepare full prompt
     full_prompt = (
@@ -272,42 +265,43 @@ def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
                 last_error = e
                 continue
     
-    # All predefined models failed - try listing and using ALL available models
-    if last_error:
+    # All predefined models failed - try listing and using available models (only if needed)
+    if last_error and _gemini_client is None:
         try:
-            print("⚠️ All predefined models failed. Listing ALL available Gemini models...")
+            print("⚠️ All predefined models failed. Listing available Gemini models...")
             available_models = []
+            # Only list models once and cache the first working one
             for model in genai.list_models():
                 if 'generateContent' in model.supported_generation_methods:
                     model_name = model.name.replace('models/', '')
                     if model_name not in model_names:  # Avoid retrying models we already tried
                         available_models.append(model_name)
-            
-            # Try all available models
-            for model_name in available_models:
-                try:
-                    _configure_gemini_api_key()
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(
-                        full_prompt,
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.1,
-                            max_output_tokens=max_tokens,
-                        )
-                    )
-                    # Save working model for next time
-                    _gemini_client = model
-                    print(f"✅ Using Gemini model: {model_name} (from list)")
-                    return response.text.strip()
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "404" in error_str or "not found" in error_str:
-                        continue
-                    elif "api key" in error_str or "authentication" in error_str:
-                        raise ValueError(f"Gemini API key error: {e}")
-                    else:
-                        # Other error - might be transient, try next
-                        continue
+                        # Try first few models immediately (don't list all)
+                        if len(available_models) <= 3:  # Only try first 3 to save time
+                            try:
+                                _configure_gemini_api_key()
+                                model_obj = genai.GenerativeModel(model_name)
+                                response = model_obj.generate_content(
+                                    full_prompt,
+                                    generation_config=genai.types.GenerationConfig(
+                                        temperature=0.1,
+                                        max_output_tokens=max_tokens,
+                                    )
+                                )
+                                # Save working model for next time
+                                _gemini_client = model_obj
+                                print(f"✅ Using Gemini model: {model_name}")
+                                return response.text.strip()
+                            except Exception as e:
+                                error_str = str(e).lower()
+                                if "404" in error_str or "not found" in error_str:
+                                    continue
+                                elif "api key" in error_str or "authentication" in error_str:
+                                    raise ValueError(f"Gemini API key error: {e}")
+                                else:
+                                    continue
+                        else:
+                            break  # Stop listing after first 3 attempts
         except Exception as list_error:
             print(f"⚠️ Could not list or use additional models: {list_error}")
     

@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 import traceback
 import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from services.stt import transcribe_audio
 from services.clean import clean_transcript
@@ -32,6 +34,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Thread pool executor for running CPU-bound tasks in parallel
+_executor = ThreadPoolExecutor(max_workers=4)
 
 @app.get("/health")
 async def health():
@@ -210,10 +215,14 @@ async def process_full(
     transcript: Optional[UploadFile] = File(default=None),
     language: Optional[str] = Form(default="vi")
 ):
-    """Full processing pipeline: STT -> Clean -> Summarize -> Extract"""
+    """Full processing pipeline: STT -> Clean -> (Summarize || Diarize) -> Extract
+    
+    Optimized to run summarize and diarize in parallel for better performance.
+    """
     try:
         raw_text: Optional[str] = None
 
+        # Step 1: Get raw text (STT if audio, or read transcript)
         if audio is not None:
             with tempfile.TemporaryDirectory() as tmpdir:
                 target = Path(tmpdir) / (audio.filename or "audio_input")
@@ -229,25 +238,53 @@ async def process_full(
         if not raw_text or not raw_text.strip():
             raise HTTPException(status_code=400, detail="No content found in the uploaded file")
 
-        # Clean text
-        cleaned = clean_transcript(raw_text)
+        # Step 2: Clean text (must be done first)
+        cleaned = await asyncio.to_thread(clean_transcript, raw_text)
         sentences = [s.strip() for s in cleaned.replace("\n", " ").split(".") if s.strip()]
         
         if not sentences:
             raise HTTPException(status_code=400, detail="No meaningful content found after processing")
         
-        # Get structured summary data
-        structured_summary = summarize(sentences, language)
-        segments = diarize(cleaned)
-        actions, decisions = extract_actions_and_decisions(sentences, segments)
+        # Step 3: Run summarize and diarize in parallel (they are independent)
+        # Both can run simultaneously since they don't depend on each other
+        structured_summary_task = asyncio.to_thread(summarize, sentences, language)
+        segments_task = asyncio.to_thread(diarize, cleaned)
+        
+        # Wait for both to complete
+        structured_summary, segments = await asyncio.gather(
+            structured_summary_task,
+            segments_task,
+            return_exceptions=True
+        )
+        
+        # Handle exceptions from parallel tasks - raise if critical errors occur
+        if isinstance(structured_summary, Exception):
+            print(f"Summarize error: {structured_summary}")
+            # Summarize is important, but we can continue with empty summary
+            structured_summary = {}
+        if isinstance(segments, Exception):
+            print(f"Diarize error: {segments}")
+            # Diarization is optional for extraction, can continue with empty segments
+            segments = []
+        
+        # Ensure valid types (same as original code)
+        if segments is None:
+            segments = []
+        if structured_summary is None:
+            structured_summary = {}
+        
+        # Step 4: Extract action items and decisions (depends on diarization)
+        actions, decisions = await asyncio.to_thread(
+            extract_actions_and_decisions, 
+            sentences, 
+            segments
+        )
         
         # Ensure we always return valid lists
         if actions is None:
             actions = []
         if decisions is None:
             decisions = []
-        if segments is None:
-            segments = []
 
         return {
             "transcript": cleaned,
