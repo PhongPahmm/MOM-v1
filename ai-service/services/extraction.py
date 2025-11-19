@@ -26,6 +26,8 @@ _gemini_client = None
 # ------------------ PROMPT ĐƯỢC RÚT GỌN & TỐI ƯU ------------------
 _EXTRACTION_PROMPT = """Extract action items and decisions from this meeting transcript. Return ONLY valid JSON, no other text.
 
+CRITICAL: Keep ALL extracted text in the SAME LANGUAGE as the transcript. If transcript is in Vietnamese, respond in Vietnamese. If in English, respond in English.
+
 Required JSON format:
 {
   "action_items": [
@@ -37,10 +39,17 @@ Required JSON format:
 }
 
 Extract:
-- Action items: tasks assigned (look for "will", "needs to", "to do", "by [date]")
-- Decisions: agreements (look for "decided", "agreed", "approved")
+- Action items: tasks assigned (look for "will", "needs to", "to do", "by [date]", or Vietnamese equivalents like "sẽ", "cần", "phải làm", "trước ngày")
+- Decisions: agreements (look for "decided", "agreed", "approved", or Vietnamese equivalents like "quyết định", "thống nhất", "chốt")
 - Owner: person's name if mentioned
-- Due date: dates like "november 6, 2025", "tonight", "by 5 pm today"
+- Due date: 
+  * MUST normalize to DD/MM/YYYY format (e.g., "10/12/2025", "15/11/2025")
+  * Relative dates: "hôm nay"/"today" → use meeting date if available
+  * If meeting date is known: calculate exact date
+  * If only mentioned as "trước ngày X" → use date X
+  * If vague or not mentioned → null
+
+IMPORTANT: Extract text EXACTLY as written in transcript without translating. Maintain the original language.
 
 Transcript:
 """
@@ -190,6 +199,7 @@ def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
     # Prepare full prompt
     full_prompt = (
         "You extract structured action items and decisions from meeting transcripts.\n"
+        "CRITICAL: Keep ALL extracted text in the SAME LANGUAGE as the transcript. Do NOT translate.\n"
         "Return ONLY valid JSON, no other text.\n\n"
         + prompt
     )
@@ -204,8 +214,19 @@ def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
                 generation_config=genai.types.GenerationConfig(
                     temperature=0.1,
                     max_output_tokens=max_tokens,
-                )
+                ),
+                safety_settings=[
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                ]
             )
+            # Check if response was blocked
+            if not response.candidates or not response.candidates[0].content.parts:
+                # Response was blocked by safety filters
+                print(f"⚠️ Gemini response blocked by safety filters: {response.prompt_feedback}")
+                raise RuntimeError(f"Response blocked by safety filters")
             return response.text.strip()
         except Exception as e:
             error_str = str(e).lower()
@@ -232,8 +253,18 @@ def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
                 generation_config=genai.types.GenerationConfig(
                     temperature=0.1,
                     max_output_tokens=max_tokens,
-                )
+                ),
+                safety_settings=[
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                ]
             )
+            # Check if response was blocked
+            if not response.candidates or not response.candidates[0].content.parts:
+                print(f"⚠️ Gemini response blocked by safety filters for model {model_name}")
+                continue
             # Save working model for next time
             _gemini_client = model
             print(f"✅ Using Gemini model: {model_name}")
@@ -253,8 +284,17 @@ def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
                         generation_config=genai.types.GenerationConfig(
                             temperature=0.1,
                             max_output_tokens=max_tokens,
-                        )
+                        ),
+                        safety_settings=[
+                            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                        ]
                     )
+                    # Check if response was blocked
+                    if not response.candidates or not response.candidates[0].content.parts:
+                        continue
                     _gemini_client = model
                     print(f"✅ Using Gemini model: {model_name} (after reconfiguring API key)")
                     return response.text.strip()
@@ -286,8 +326,17 @@ def _generate_with_gemini(prompt: str, max_tokens: int = 1500) -> str:
                                     generation_config=genai.types.GenerationConfig(
                                         temperature=0.1,
                                         max_output_tokens=max_tokens,
-                                    )
+                                    ),
+                                    safety_settings=[
+                                        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                                        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                                        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                                        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                                    ]
                                 )
+                                # Check if response was blocked
+                                if not response.candidates or not response.candidates[0].content.parts:
+                                    continue
                                 # Save working model for next time
                                 _gemini_client = model_obj
                                 print(f"✅ Using Gemini model: {model_name}")
@@ -322,7 +371,7 @@ def _generate_with_llm(prompt: str, max_tokens: int = 1500) -> str:
             completion = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You extract structured action items and decisions from meeting transcripts. Return ONLY valid JSON."},
+                    {"role": "system", "content": "You extract structured action items and decisions from meeting transcripts. CRITICAL: Keep ALL extracted text in the SAME LANGUAGE as the transcript. Do NOT translate. Return ONLY valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
